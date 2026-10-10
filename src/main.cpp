@@ -1,7 +1,6 @@
 #include<iostream>
-#include<cstdio>
-#include<cstdlib>
 #include<opencv2/opencv.hpp>
+#include<string>
 using namespace std;
 int main(int argc,char* argv[])//argc参数个数 argv参数 argv[0]是程序名 都在命令行输入
 {
@@ -10,7 +9,12 @@ int main(int argc,char* argv[])//argc参数个数 argv参数 argv[0]是程序名
         cout<<"用法："<<argv[0]<<"<输入图片><输出图片>"; //当命令输入不合法时提示
         return 1;
     }
-
+    
+    if((string)argv[1] == (string) argv[2])
+    {
+        cout<<"输入图片和输出图片不能相同"<<endl;
+        return 1;
+    }
     cv::Mat img=cv::imread(argv[1],cv::IMREAD_COLOR); //Mat表示矩阵 imread读取图像 IMREAD_COLOR强制读3通道彩色BGR
 
     if(img.empty())
