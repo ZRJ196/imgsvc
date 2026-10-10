@@ -221,3 +221,11 @@ epoll 原理，红黑树、就绪链表；惊群效应是什么，SO_REUSEPORT �
 4. 先打通最小链路，链路跑通之后，再做性能优化。
 5. 每天 git 提交代码；卡住超过 2 小时，就停下来求助。
 6. 每周复盘：本周踩了什么坑，做了哪些设计取舍。
+
+git用法：git init 初始化仓库
+        echo "xxx" > .gitignore 告诉git哪些文件不需要追踪
+        git status 查状态
+        git add .把改动放进暂存区
+        git commit -m "xxx" 本地保存 -m后是备注
+        git remote add origin https://github.com/ZRJ196/imgsvc 关联github
+        git push -u origin main 上传github
