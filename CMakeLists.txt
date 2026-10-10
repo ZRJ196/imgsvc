@@ -1,5 +1,6 @@
 #编译执行指令 cmake -B build 生成makefile 在第一次和修改了CMakeLists.txt后跑
 #            cmake --build build 按makefile调用g++链接 每次修改.cpp后跑
+#            ./build/imgsvc执行代码
 cmake_minimum_required(VERSION 3.16) #配置cmake版本
 project(imgsvc CXX) #项目名和语言
 
