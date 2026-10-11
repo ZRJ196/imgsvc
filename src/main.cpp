@@ -81,7 +81,7 @@ try {
     //输出节点7个[1,1,320,320]表示从7个不同层输出1个单通道的320*320图 用第0个推理
 
         // ---- 1.把 blob 包装成 ORT 输入张量 ----
-    std::vector<int64_t> inputShape = {1, 3, 320, 320};
+    vector<int64_t> inputShape = {1, 3, 320, 320};
     auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
     Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
@@ -107,10 +107,35 @@ try {
     float* mask = outputs[0].GetTensorMutableData<float>();
     // mask 指向 320*320 个 float
 
-        cv::Mat maskMat(320, 320, CV_32FC1, mask);   // 用 OpenCV 包一层，方便算 min/max
-    double mn = 0, mx = 0;
-    cv::minMaxIdx(maskMat, &mn, &mx);
-    cout << "掩码范围: min=" << mn << "  max=" << mx << endl;
+    //还原
+        // mask 指向 320*320 个 float，值域 0~1
+    cv::Mat maskMat(320, 320, CV_32FC1, mask);
+
+    // ---- 1.放大回原图尺寸 ----
+    cv::Mat maskFull;//放大输出图
+    cv::resize(maskMat, maskFull, img.size(), 0, 0, cv::INTER_LINEAR);
+    //                                                      ^^^^^^^^^^^^^
+    //                                    放大用 LINEAR/CUBIC，不是INTER_AREA
+
+    // ---- 2.转成 8 位灰度（0~255）----
+    cv::Mat mask8;
+    maskFull.convertTo(mask8, CV_8U, 255.0);   // 乘以 255 并转成 uchar
+    cv::imwrite("out/mask.png", mask8);        // 顺手存一份掩码，方便你亲眼看看
+
+    // ---- 3.给原图加上 alpha 通道 ----
+    vector<cv::Mat> ch;
+    cv::split(img, ch);          // 把 BGR 拆成三个单通道 ch[0]B通道 ch[1]G通道 ch[2]R通道
+    ch.push_back(mask8);         // 再把掩码作为第 4 个通道（alpha）加进去 ch[3]
+    cv::Mat rgba;                // 四通道
+    cv::merge(ch, rgba);         // 合并成 BGRA 四通道
+
+    // ---- 4.保存 ----
+    if (!cv::imwrite(argv[2], rgba)) {
+        cout << "写入失败: " << argv[2] << endl;
+        return 1;
+    }
+    cout << "已保存: " << argv[2] << endl;
+//把u2net得到的显著性掩码映射成alpha通道 于是就得到了主题显著背景透明的图像
 } catch (const Ort::Exception& e) {
     cout << "模型加载失败: " << e.what() << endl;//当try中的代码有误时进入catch
     return 1;
