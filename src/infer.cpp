@@ -10,7 +10,7 @@ bool infer(const std::string& modelPath, const cv::Mat& blob, std::vector<float>
         Ort::Session session(env, modelPath.c_str(), opts);    // 加载模型
         Ort::AllocatorWithDefaultOptions alloc;                // 用于接收 ORT 返回的字符串
 
-        // ---- 打印模型的输入输出接口（换模型时一眼就能看到要求）----
+        // ---- 打印模型的输入输出接口（换模型时能看到要求）----
         size_t nIn = session.GetInputCount();
         for (size_t i = 0; i < nIn; ++i) {
             auto name  = session.GetInputNameAllocated(i, alloc);

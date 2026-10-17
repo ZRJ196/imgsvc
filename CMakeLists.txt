@@ -24,6 +24,8 @@ add_executable(imgsvc
     src/infer.cpp
     src/postprocess.cpp)
 
+add_executable(imgsvc-server src/server.cpp)
+
 # ---- 给目标挂属性（必须在 add_executable 之后）----
 target_include_directories(imgsvc PRIVATE
     include                      # 自己的头文件目录
@@ -31,3 +33,4 @@ target_include_directories(imgsvc PRIVATE
 
 target_link_libraries(imgsvc PRIVATE ${OpenCV_LIBS})
 target_link_libraries(imgsvc PRIVATE ${ONNXRUNTIME_LIB})
+target_include_directories(imgsvc-server PRIVATE include)
