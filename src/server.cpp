@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -8,18 +9,49 @@
 #define BUF_SIZE 1024
 #define PORT 8080
 
-void send_response(int conn_fd, const char* status, const char* body)
+// 把数据完整发出去（处理"短写"）
+// send 的返回值是【实际发出】的字节数，不保证一次发完；
+// 数据大时内核 socket 缓冲区会满，所以要循环直到全部发完。
+static void send_all(int fd, const void* data, size_t len)
 {
-    char resp[2048];
-    int n = snprintf(resp, sizeof(resp),
-        "HTTP/1.1 %s\r\n"                    // ← 状态从参数来
-        "Content-Type: text/html; charset=utf-8\r\n"
+    const char* p = (const char*)data;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        if (n <= 0) {
+            fprintf(stderr, "send 失败: %s\n", strerror(errno));
+            return;
+        }
+        sent += (size_t)n;
+    }
+}
+
+// 发送 HTTP 响应
+//   body 是 void*（不是 char*）—— 因为要能发二进制（图片）
+//   body_len 必须显式传 —— 因为二进制数据里可能包含 '\0'，不能用 strlen
+void send_response(int conn_fd, const char* status, const char* content_type,
+                   const void* body, size_t body_len)
+{
+    // ① 只拼头部（纯文本、小，可以安全用 snprintf）
+    char header[512];
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        status, strlen(body), body);          // ← status 在这里插进去
-    send(conn_fd, resp, n, MSG_NOSIGNAL);
+        "\r\n",
+        status, content_type, body_len);
+
+    if (n < 0 || n >= (int)sizeof(header)) {
+        fprintf(stderr, "响应头太长，被截断了 (n=%d)\n", n);
+        return;
+    }
+
+    // ② 先发头，再发 body —— 绝不能把二进制塞进 %s 里拼
+    send_all(conn_fd, header, (size_t)n);
+    if (body != NULL && body_len > 0) {
+        send_all(conn_fd, body, body_len);
+    }
 }
 
 int main()
@@ -41,13 +73,13 @@ int main()
     serv_addr.sin_port = htons(PORT);          // 端口号：转网络字节序（大端）
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY); // 绑定本机所有网卡IP
     //绑定IP 端口
-    if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1) 
+    if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
     {
-        perror("bind 绑定失败"); 
+        perror("bind 绑定失败");
         exit(1);
     }
     //开始监听
-    if (listen(listen_fd, 5) == -1) 
+    if (listen(listen_fd, 5) == -1)
     {
         perror("listen 监听失败"); exit(1); //5表示全连接队列最大长度
     }
@@ -62,12 +94,13 @@ int main()
         "<p>图像抠图服务 · 运行中</p>"
         "</body></html>";
     const char* not_found_body =
-    "<!DOCTYPE html>"
-    "<html><head><meta charset='utf-8'><title>404 Not Found</title></head>"
-    "<body style='font-family:sans-serif;padding:40px'>"
-    "<h1>404 Not Found</h1>"
-    "<p>请求的页面不存在</p>"
-    "</body></html>";
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='utf-8'><title>404 Not Found</title></head>"
+        "<body style='font-family:sans-serif;padding:40px'>"
+        "<h1>404 Not Found</h1>"
+        "<p>请求的页面不存在</p>"
+        "</body></html>";
+
     //循环接收客户端连接
     while(1)
     {
@@ -75,10 +108,10 @@ int main()
         socklen_t cli_len = sizeof(cli_addr);//保存客户端地址信息
         // 阻塞等待客户端连接，成功返回新的连接套接字
         int conn_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
-        if (conn_fd == -1) 
-        { 
+        if (conn_fd == -1)
+        {
             perror("accept 失败");
-             continue; 
+             continue;
         }
         fprintf(stderr, "客户端接入：%s : %d\n",
                 inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port));
@@ -86,29 +119,32 @@ int main()
         //接收数据
         char buf[BUF_SIZE] = {0};
         ssize_t recv_len = recv(conn_fd, buf, BUF_SIZE - 1, 0);
-        if (recv_len > 0) 
+        if (recv_len > 0)
         {
             //把客户端发来的原始请求打印出来
             fprintf(stderr, "---- 收到请求 ----\n%s\n------------------\n", buf);
 
             char method[16]={0};
             char path[256]={0};
-            sscanf(buf,"%15s %255s",method,path);
-            
+            sscanf(buf,"%15s %255s",method,path); //将缓存中get和路径读入
+
             if(strcmp(path,"/")==0)
             {
-              send_response(conn_fd,"200 OK",html_body);
+                send_response(conn_fd, "200 OK", "text/html; charset=utf-8",
+                              html_body, strlen(html_body));
             }
-            else{
-                send_response(conn_fd,"404 NOT FOUND",not_found_body);
+            else
+            {
+                send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
+                              not_found_body, strlen(not_found_body));
             }
-           
-        } 
-        else if (recv_len == 0) 
+
+        }
+        else if (recv_len == 0)
         {
             fprintf(stderr, "客户端正常关闭连接\n");
-        } 
-        else 
+        }
+        else
         {
             perror("recv 出错");
         }
