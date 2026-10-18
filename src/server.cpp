@@ -6,11 +6,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include<fcntl.h>
+#include<sys/stat.h>
 #define BUF_SIZE 1024
 #define PORT 8080
 
 // 把数据完整发出去（处理"短写"）
-// send 的返回值是【实际发出】的字节数，不保证一次发完；
+// send 的返回值是实际发出的字节数，不保证一次发完；
 // 数据大时内核 socket 缓冲区会满，所以要循环直到全部发完。
 static void send_all(int fd, const void* data, size_t len)
 {
@@ -32,7 +34,7 @@ static void send_all(int fd, const void* data, size_t len)
 void send_response(int conn_fd, const char* status, const char* content_type,
                    const void* body, size_t body_len)
 {
-    // ① 只拼头部（纯文本、小，可以安全用 snprintf）
+    // 只拼头部
     char header[512];
     int n = snprintf(header, sizeof(header),
         "HTTP/1.1 %s\r\n"
@@ -47,13 +49,60 @@ void send_response(int conn_fd, const char* status, const char* content_type,
         return;
     }
 
-    // ② 先发头，再发 body —— 绝不能把二进制塞进 %s 里拼
+    // 先发头，再发 body 不能把二进制塞进 %s 里拼
     send_all(conn_fd, header, (size_t)n);
     if (body != NULL && body_len > 0) {
         send_all(conn_fd, body, body_len);
     }
 }
 
+// 把整个文件读进内存
+// 成功返回 true，*out 指向 malloc 出来的缓冲区，*out_len 是字节数
+// 调用者负责 free(*out)
+static bool read_file(const char* filename, char** out, long* out_len)
+{
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        return false;                    // 文件不存在 / 没权限
+    }
+
+    struct stat st;//stat类型是文件元信息 fstat函数把fd对应的文件中的元信息存入stat
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return false;
+    }
+
+    long size = st.st_size;//文件大小
+    char* data = (char*)malloc(size > 0 ? (size_t)size : 1);
+    if (data == NULL) 
+    {
+        close(fd);
+        return false;//分配失败
+    }
+    
+    long got=0;
+    while(got<size)
+    {
+        ssize_t r = read(fd, data + got, (size_t)(size - got));
+        if(r<0)
+        {
+            if(errno==EINTR) continue;
+            fprintf(stderr, "send 失败: %s\n", strerror(errno));
+            close(fd);
+            free(data);
+            return false;
+        }
+        if(r==0) break;
+        got+=r;
+    }
+    // 循环 read，直到读满 size 字节
+    // read 也可能只读一部分
+    // r < 0出错；r == 0 文件提前结束
+    close(fd);
+    *out = data;
+    *out_len = got;
+    return true;
+}
 int main()
 {
     //创建socket
@@ -130,8 +179,18 @@ int main()
 
             if(strcmp(path,"/")==0)
             {
-                send_response(conn_fd, "200 OK", "text/html; charset=utf-8",
-                              html_body, strlen(html_body));
+                char*data=NULL;
+                long len=0;
+                if(read_file("static/index.html", &data, &len))
+                {
+                    send_response(conn_fd, "200 OK", "text/html; charset=utf-8",
+                              data, size_t(len));
+                              free(data);
+                }
+                else{
+                    send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
+                              not_found_body, strlen(not_found_body));
+                }
             }
             else
             {
