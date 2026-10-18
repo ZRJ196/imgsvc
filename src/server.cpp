@@ -8,6 +8,20 @@
 #define BUF_SIZE 1024
 #define PORT 8080
 
+void send_response(int conn_fd, const char* status, const char* body)
+{
+    char resp[2048];
+    int n = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 %s\r\n"                    // ← 状态从参数来
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        status, strlen(body), body);          // ← status 在这里插进去
+    send(conn_fd, resp, n, MSG_NOSIGNAL);
+}
+
 int main()
 {
     //创建socket
@@ -40,14 +54,20 @@ int main()
     fprintf(stderr, "HTTP 服务端启动，监听端口 %d...\n", PORT);
 
     //要返回的 HTML 页面
-    const char* body =
+    const char* html_body =
         "<!DOCTYPE html>"
         "<html><head><meta charset='utf-8'><title>imgsvc</title></head>"
         "<body style='font-family:sans-serif;padding:40px'>"
         "<h1>imgsvc</h1>"
         "<p>图像抠图服务 · 运行中</p>"
         "</body></html>";
-
+    const char* not_found_body =
+    "<!DOCTYPE html>"
+    "<html><head><meta charset='utf-8'><title>404 Not Found</title></head>"
+    "<body style='font-family:sans-serif;padding:40px'>"
+    "<h1>404 Not Found</h1>"
+    "<p>请求的页面不存在</p>"
+    "</body></html>";
     //循环接收客户端连接
     while(1)
     {
@@ -66,32 +86,30 @@ int main()
         //接收数据
         char buf[BUF_SIZE] = {0};
         ssize_t recv_len = recv(conn_fd, buf, BUF_SIZE - 1, 0);
-        if (recv_len > 0) {
-            //把客户端发来的原始请求打印出来（日志走 stderr，无缓冲，不会丢）
+        if (recv_len > 0) 
+        {
+            //把客户端发来的原始请求打印出来
             fprintf(stderr, "---- 收到请求 ----\n%s\n------------------\n", buf);
 
-            // 构造 HTTP 响应：状态行 + 头 + 空行 + body
-            // 注意：行尾必须是 \r\n；Content-Length 是 body 的【字节数】
-            char resp[2048];
-            int resp_len = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body), body);
-
-            if (resp_len < 0) {
-                perror("snprintf 失败");
-            } else if (resp_len >= (int)sizeof(resp)) {
-                fprintf(stderr, "响应太长，被截断了\n");
-            } else {
-                send(conn_fd, resp, resp_len, MSG_NOSIGNAL);
+            char method[16]={0};
+            char path[256]={0};
+            sscanf(buf,"%15s %255s",method,path);
+            
+            if(strcmp(path,"/")==0)
+            {
+              send_response(conn_fd,"200 OK",html_body);
             }
-        } else if (recv_len == 0) {
+            else{
+                send_response(conn_fd,"404 NOT FOUND",not_found_body);
+            }
+           
+        } 
+        else if (recv_len == 0) 
+        {
             fprintf(stderr, "客户端正常关闭连接\n");
-        } else {
+        } 
+        else 
+        {
             perror("recv 出错");
         }
 
