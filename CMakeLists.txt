@@ -12,25 +12,33 @@ add_compile_options(-Wall -Wextra)#bug报警
 # ---- 找依赖 ----
 list(APPEND CMAKE_PREFIX_PATH /opt/onnxruntime)
 find_package(OpenCV REQUIRED) #添加opencv库
-# ONNX Runtime：官方 tarball 自带的 CMake 配置和实际布局不一致（它假设 lib64/ 和
-# include/onnxruntime/，实际是 lib/ 和 include/），所以不用 find_package，
-# 直接用 find_library 指定路径
+# ONNX Runtime：官方 tarball 自带的 CMake 配置和实际布局不一致，直接用 find_library
 find_library(ONNXRUNTIME_LIB NAMES onnxruntime PATHS /opt/onnxruntime/lib REQUIRED)
 
-# ---- 定义目标：四个源文件 ----
-add_executable(imgsvc
-    src/main.cpp
+# ---- 三个模块（两个可执行文件共用）----
+set(IMGSVC_MODULES
     src/preprocess.cpp
     src/infer.cpp
     src/postprocess.cpp)
 
-add_executable(imgsvc-server src/server.cpp)
+# ---- 命令行工具 ----
+add_executable(imgsvc
+    src/main.cpp
+    ${IMGSVC_MODULES})
 
-# ---- 给目标挂属性（必须在 add_executable 之后）----
 target_include_directories(imgsvc PRIVATE
-    include                      # 自己的头文件目录
-    /opt/onnxruntime/include)    # ONNX Runtime 头文件
-
+    include
+    /opt/onnxruntime/include)
 target_link_libraries(imgsvc PRIVATE ${OpenCV_LIBS})
 target_link_libraries(imgsvc PRIVATE ${ONNXRUNTIME_LIB})
-target_include_directories(imgsvc-server PRIVATE include)
+
+# ---- HTTP 服务端 ----
+add_executable(imgsvc-server
+    src/server.cpp
+    ${IMGSVC_MODULES})
+
+target_include_directories(imgsvc-server PRIVATE
+    include
+    /opt/onnxruntime/include)
+target_link_libraries(imgsvc-server PRIVATE ${OpenCV_LIBS})
+target_link_libraries(imgsvc-server PRIVATE ${ONNXRUNTIME_LIB})

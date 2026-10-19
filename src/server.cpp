@@ -1,3 +1,7 @@
+#include "preprocess.h"
+#include "infer.h"
+#include "postprocess.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,21 +10,22 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <vector>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define BUF_SIZE 1024
 #define PORT 8080
 #define STATIC_ROOT "static"
+#define MODEL_PATH "models/u2net.onnx"
 
 // 单个请求的最大字节数（头 + body）。
-// 注意：不能按 Content-Length 去 malloc ——恶意客户端谎报一个巨大值会耗尽内存。
+// 不能按 Content-Length 去 malloc ——恶意客户端谎报巨大值会耗尽内存。
 #define MAX_REQUEST (10 * 1024 * 1024)
 
-// recv 超时（秒）。防止"客户端连上来了但一个字不发"把单线程服务器卡死。
+// recv 超时（秒）。防止"客户端连上了但一个字不发"把单线程服务器卡死。
 #define RECV_TIMEOUT_SEC 5
 
 // ---------- 发数据 ----------
@@ -161,7 +166,6 @@ static const char* content_type_of(const char* filename)
 
 // ---------- HTTP 头解析 ----------
 
-// 大小写不敏感地在 haystack 里找 needle（HTTP 头名是大小写不敏感的）
 static char* find_ci(char* haystack, const char* needle)
 {
     size_t nlen = strlen(needle);
@@ -173,8 +177,6 @@ static char* find_ci(char* haystack, const char* needle)
     return NULL;
 }
 
-// 在 req（长度 req_len，已 NUL 结尾）里找头部结束标记 \r\n\r\n
-// 找到返回 body 的起始指针，找不到返回 NULL
 static char* find_body_start(char* req)
 {
     char* sep = strstr(req, "\r\n\r\n");
@@ -185,11 +187,18 @@ static char* find_body_start(char* req)
 
 int main()
 {
+    // ===== 模型只加载一次，常驻内存 =====
+    InferEngine engine(MODEL_PATH);
+    if (!engine.ok()) {
+        fprintf(stderr, "模型加载失败，服务端退出\n");
+        return 1;
+    }
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd == -1)
     {
         perror("socket创建失败");
-        exit(1);
+        return 1;
     }
 
     int opt = 1;
@@ -204,20 +213,20 @@ int main()
     if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
     {
         perror("bind 绑定失败");
-        exit(1);
+        return 1;
     }
     if (listen(listen_fd, 5) == -1)
     {
         perror("listen 监听失败");
-        exit(1);
+        return 1;
     }
     fprintf(stderr, "HTTP 服务端启动，监听端口 %d，静态目录 %s/\n", PORT, STATIC_ROOT);
 
-    // 请求缓冲区只分配一次，每个连接复用（避免每请求 malloc 10MB）
+    // 请求缓冲区只分配一次，每个连接复用
     char* req = (char*)malloc(MAX_REQUEST);
     if (req == NULL) {
         fprintf(stderr, "malloc 失败\n");
-        exit(1);
+        return 1;
     }
 
     const char* not_found_body =
@@ -247,7 +256,6 @@ int main()
             continue;
         }
 
-        // 设置接收超时：客户端不发数据时 recv 不会永远阻塞
         struct timeval tv;
         tv.tv_sec  = RECV_TIMEOUT_SEC;
         tv.tv_usec = 0;
@@ -259,7 +267,7 @@ int main()
         long req_len = 0;
         char* body = NULL;
 
-        // ===== ① 收完整的【请求头】（直到出现 \r\n\r\n）=====
+        // ===== ① 收完整的请求头（直到出现 \r\n\r\n）=====
         while (body == NULL) {
             if (req_len >= MAX_REQUEST - 1) {
                 fprintf(stderr, "请求头超过上限\n");
@@ -274,12 +282,11 @@ int main()
                 break;
             }
             req_len += n;
-            req[req_len] = '\0';            // 保持 NUL 结尾，strstr 才能安全扫描
+            req[req_len] = '\0';
             body = find_body_start(req);
         }
 
         if (body == NULL) {
-            // 没收到完整的头：客户端断开 / 超时 / 请求非法
             fprintf(stderr, "  没有收到完整的请求头（%ld 字节）\n", req_len);
             send_response(conn_fd, "400 Bad Request", "text/html; charset=utf-8",
                           bad_request_body, strlen(bad_request_body));
@@ -287,7 +294,7 @@ int main()
             continue;
         }
 
-        // 头部日志（用 fwrite 显式长度，body 可能是二进制）
+        // 只把【请求头】写进日志（body 可能是二进制）
         fprintf(stderr, "---- 请求头 ----\n");
         fwrite(req, 1, (size_t)(body - req), stderr);
         fprintf(stderr, "\n----------------\n");
@@ -302,14 +309,15 @@ int main()
             continue;
         }
 
-        // ===== ③ 解析 Content-Length，把【整个 body】收完 =====
+        // ===== ③ 收完整的 body =====
         long content_length = 0;
         char* cl = find_ci(req, "Content-Length:");
         if (cl != NULL) {
             content_length = atol(cl + strlen("Content-Length:"));
         }
 
-        if (content_length < 0 || (size_t)(body - req) + (size_t)content_length >= (size_t)MAX_REQUEST) {
+        if (content_length < 0 ||
+            (size_t)(body - req) + (size_t)content_length >= (size_t)MAX_REQUEST) {
             fprintf(stderr, "  Content-Length 不合法或超限: %ld\n", content_length);
             send_response(conn_fd, "413 Payload Too Large", "text/html; charset=utf-8",
                           bad_request_body, strlen(bad_request_body));
@@ -332,10 +340,9 @@ int main()
             body_got += n;
         }
 
-        // ★ 关键验证：收到的 body 字节数必须等于 Content-Length
-        fprintf(stderr, "  %s %s | Content-Length=%ld | 实际收到 body=%ld 字节 | %s\n",
+        fprintf(stderr, "  %s %s | Content-Length=%ld | 收到 body=%ld 字节 | %s\n",
                 method, path, content_length, body_got,
-                (body_got == content_length) ? "✅ 一致" : "❌ 不一致");
+                (body_got == content_length) ? "OK" : "不一致");
 
         // ===== ④ 路由 =====
         if (strcmp(method, "GET") == 0)
@@ -360,10 +367,42 @@ int main()
         }
         else if (strcmp(method, "POST") == 0)
         {
-            // 第 5 步：先把 body 原样返回，用来验证"收全了"
-            // 下一步会在这里接 /infer
-            send_response(conn_fd, "200 OK", "text/plain; charset=utf-8",
-                          body, (size_t)body_got);
+            if (strcmp(path, "/infer") == 0)
+            {
+                // 上传的图片原始字节 → 解码 → 预处理 → 推理 → 透明背景 PNG
+                std::vector<unsigned char> bytes(body, body + body_got);
+                cv::Mat blob, orig;
+                std::vector<float> mask;
+                std::vector<unsigned char> png;
+
+                if (!preprocess_bytes(bytes, blob, orig)) {
+                    fprintf(stderr, "  /infer: 不是有效图片（%ld 字节）\n", body_got);
+                    send_response(conn_fd, "400 Bad Request", "text/plain; charset=utf-8",
+                                  "不是有效的图片", strlen("不是有效的图片"));
+                } else if (!engine.run(blob, mask)) {
+                    send_response(conn_fd, "500 Internal Server Error",
+                                  "text/plain; charset=utf-8",
+                                  "推理失败", strlen("推理失败"));
+                } else if (!make_cutout_png(orig, mask, png)) {
+                    send_response(conn_fd, "500 Internal Server Error",
+                                  "text/plain; charset=utf-8",
+                                  "生成图片失败", strlen("生成图片失败"));
+                } else {
+                    fprintf(stderr, "  /infer: 输入 %ld 字节 (%dx%d) → PNG %zu 字节\n",
+                            body_got, orig.cols, orig.rows, png.size());
+                    send_response(conn_fd, "200 OK", "image/png", png.data(), png.size());
+                }
+            }
+            else if (strcmp(path, "/echo") == 0)
+            {
+                send_response(conn_fd, "200 OK", "text/plain; charset=utf-8",
+                              body, (size_t)body_got);
+            }
+            else
+            {
+                send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
+                              not_found_body, strlen(not_found_body));
+            }
         }
         else
         {

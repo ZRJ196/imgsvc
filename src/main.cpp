@@ -19,19 +19,25 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // ---- 1.读图 + 预处理 ----
+    // ---- ① 读图 + 预处理 ----
     cv::Mat blob, orig;
     if (!preprocess(argv[1], blob, orig)) {
         return 1;
     }
 
-    // ---- 2.推理 ----
-    std::vector<float> mask;
-    if (!infer("models/u2net.onnx", blob, mask)) {
+    // ---- ② 加载模型（只加载一次）----
+    InferEngine engine("models/u2net.onnx");
+    if (!engine.ok()) {
         return 1;
     }
 
-    // ---- 3.后处理 + 保存 ----
+    // ---- ③ 推理 ----
+    std::vector<float> mask;
+    if (!engine.run(blob, mask)) {
+        return 1;
+    }
+
+    // ---- ④ 后处理 + 保存 ----
     if (!saveCutout(argv[2], orig, mask)) {
         return 1;
     }
