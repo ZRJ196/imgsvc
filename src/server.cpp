@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>        // strncasecmp
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -14,9 +16,15 @@
 #define PORT 8080
 #define STATIC_ROOT "static"
 
+// 单个请求的最大字节数（头 + body）。
+// 注意：不能按 Content-Length 去 malloc ——恶意客户端谎报一个巨大值会耗尽内存。
+#define MAX_REQUEST (10 * 1024 * 1024)
+
+// recv 超时（秒）。防止"客户端连上来了但一个字不发"把单线程服务器卡死。
+#define RECV_TIMEOUT_SEC 5
+
 // ---------- 发数据 ----------
 
-// 把数据完整发出去
 static void send_all(int fd, const void* data, size_t len)
 {
     const char* p = (const char*)data;
@@ -31,7 +39,6 @@ static void send_all(int fd, const void* data, size_t len)
     }
 }
 
-// 发送 HTTP 响应（二进制安全：body 用 void* + 显式长度）
 static void send_response(int conn_fd, const char* status, const char* content_type,
                           const void* body, size_t body_len)
 {
@@ -57,7 +64,6 @@ static void send_response(int conn_fd, const char* status, const char* content_t
 
 // ---------- 读文件 ----------
 
-// 把整个文件读进内存。成功返回 true，*out 由调用者 free
 static bool read_file(const char* filename, char** out, long* out_len)
 {
     int fd = open(filename, O_RDONLY);
@@ -88,38 +94,30 @@ static bool read_file(const char* filename, char** out, long* out_len)
             free(data);
             return false;
         }
-        if (r == 0) break;              // 文件比 fstat 说的短
+        if (r == 0) break;
         got += r;
     }
 
     close(fd);
     *out = data;
-    *out_len = got;                     // 用实际读到的字节数
+    *out_len = got;
     return true;
 }
 
 // ---------- 路径安全 ----------
 
-// 把请求路径安全地映射到 static/ 下的文件
-//   1.把路径规范化成绝对路径（realpath 会解析掉所有 ../ 和符号链接）
-//   2.检查规范化后的结果是否还在 static 目录里面
-//
-// 成功返回 true，out 收到规范化后的绝对路径；否则 false
 static bool safe_path(const char* path, char* out, size_t out_size)
 {
-    // static 目录的绝对路径只算一次
     static char static_root[PATH_MAX];
     static int  inited = 0;
     if (!inited) {
-        if (realpath(STATIC_ROOT, static_root) == NULL)  //realpath函数把相对路径改为绝对路径
-        {
+        if (realpath(STATIC_ROOT, static_root) == NULL) {
             fprintf(stderr, "找不到静态目录 %s: %s\n", STATIC_ROOT, strerror(errno));
             return false;
         }
         inited = 1;
     }
 
-    //拼成 static/xxx
     char joined[1024];
     if (strcmp(path, "/") == 0) {
         snprintf(joined, sizeof(joined), "%s/index.html", STATIC_ROOT);
@@ -127,19 +125,16 @@ static bool safe_path(const char* path, char* out, size_t out_size)
         snprintf(joined, sizeof(joined), "%s%s", STATIC_ROOT, path);
     }
 
-    //规范化：解析掉 ../ 和符号链接
     char resolved[PATH_MAX];
     if (realpath(joined, resolved) == NULL) {
-        return false;                   // 文件不存在 / 没权限
+        return false;
     }
 
-    //校验：必须还在 static_root 里面
     size_t root_len = strlen(static_root);
     if (strncmp(resolved, static_root, root_len) != 0) {
-        return false;                   // 跳出 static 了
+        return false;
     }
-    // 前缀校验的问题：必须确认后面紧跟 '/' 或结束，
-    //   否则 static_bak/xxx 也会被判定为"以 static 开头"而放过
+    // 前缀校验的陷阱：后面必须紧跟 '/' 或结束
     if (resolved[root_len] != '\0' && resolved[root_len] != '/') {
         return false;
     }
@@ -148,22 +143,42 @@ static bool safe_path(const char* path, char* out, size_t out_size)
     return true;
 }
 
-// ---------- Content-Type ----------
-
 static const char* content_type_of(const char* filename)
 {
-    const char* dot = strrchr(filename, '.');//从字符串尾部找第一个. 就是拿到后缀起始地址
-    if (dot == NULL) return "application/octet-stream";//返回二进制流
-    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html; charset=utf-8";//网页
-    if (strcmp(dot, ".css")  == 0) return "text/css; charset=utf-8";//样式表
-    if (strcmp(dot, ".js")   == 0) return "application/javascript; charset=utf-8";//JS脚本
-    if (strcmp(dot, ".json") == 0) return "application/json; charset=utf-8";//json数据
-    if (strcmp(dot, ".txt")  == 0) return "text/plain; charset=utf-8";//文本
-    if (strcmp(dot, ".png")  == 0) return "image/png";//png图片
-    if (strcmp(dot, ".jpg")  == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";//jpg图片
-    if (strcmp(dot, ".svg")  == 0) return "image/svg+xml";//矢量图
-    if (strcmp(dot, ".ico")  == 0) return "image/x-icon";//网站图标
+    const char* dot = strrchr(filename, '.');
+    if (dot == NULL) return "application/octet-stream";
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html; charset=utf-8";
+    if (strcmp(dot, ".css")  == 0) return "text/css; charset=utf-8";
+    if (strcmp(dot, ".js")   == 0) return "application/javascript; charset=utf-8";
+    if (strcmp(dot, ".json") == 0) return "application/json; charset=utf-8";
+    if (strcmp(dot, ".txt")  == 0) return "text/plain; charset=utf-8";
+    if (strcmp(dot, ".png")  == 0) return "image/png";
+    if (strcmp(dot, ".jpg")  == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(dot, ".svg")  == 0) return "image/svg+xml";
+    if (strcmp(dot, ".ico")  == 0) return "image/x-icon";
     return "application/octet-stream";
+}
+
+// ---------- HTTP 头解析 ----------
+
+// 大小写不敏感地在 haystack 里找 needle（HTTP 头名是大小写不敏感的）
+static char* find_ci(char* haystack, const char* needle)
+{
+    size_t nlen = strlen(needle);
+    for (char* p = haystack; *p != '\0'; ++p) {
+        if (strncasecmp(p, needle, nlen) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+// 在 req（长度 req_len，已 NUL 结尾）里找头部结束标记 \r\n\r\n
+// 找到返回 body 的起始指针，找不到返回 NULL
+static char* find_body_start(char* req)
+{
+    char* sep = strstr(req, "\r\n\r\n");
+    return (sep == NULL) ? NULL : sep + 4;
 }
 
 // ---------- main ----------
@@ -198,20 +213,28 @@ int main()
     }
     fprintf(stderr, "HTTP 服务端启动，监听端口 %d，静态目录 %s/\n", PORT, STATIC_ROOT);
 
+    // 请求缓冲区只分配一次，每个连接复用（避免每请求 malloc 10MB）
+    char* req = (char*)malloc(MAX_REQUEST);
+    if (req == NULL) {
+        fprintf(stderr, "malloc 失败\n");
+        exit(1);
+    }
+
     const char* not_found_body =
         "<!DOCTYPE html>"
         "<html><head><meta charset='utf-8'><title>404 Not Found</title></head>"
         "<body style='font-family:sans-serif;padding:40px'>"
-        "<h1>404 Not Found</h1>"
-        "<p>请求的页面不存在</p>"
-        "</body></html>";
+        "<h1>404 Not Found</h1><p>请求的页面不存在</p></body></html>";
     const char* internal_error_body =
         "<!DOCTYPE html>"
         "<html><head><meta charset='utf-8'><title>500 Internal Server Error</title></head>"
         "<body style='font-family:sans-serif;padding:40px'>"
-        "<h1>500 Internal Server Error</h1>"
-        "<p>服务器内部错误</p>"
-        "</body></html>";
+        "<h1>500 Internal Server Error</h1><p>服务器内部错误</p></body></html>";
+    const char* bad_request_body =
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='utf-8'><title>400 Bad Request</title></head>"
+        "<body style='font-family:sans-serif;padding:40px'>"
+        "<h1>400 Bad Request</h1><p>请求格式不对</p></body></html>";
 
     while (1)
     {
@@ -223,60 +246,135 @@ int main()
             perror("accept 失败");
             continue;
         }
+
+        // 设置接收超时：客户端不发数据时 recv 不会永远阻塞
+        struct timeval tv;
+        tv.tv_sec  = RECV_TIMEOUT_SEC;
+        tv.tv_usec = 0;
+        setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         fprintf(stderr, "客户端接入：%s : %d\n",
                 inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port));
 
-        char buf[BUF_SIZE] = {0};
-        ssize_t recv_len = recv(conn_fd, buf, BUF_SIZE - 1, 0);
-        if (recv_len > 0)
+        long req_len = 0;
+        char* body = NULL;
+
+        // ===== ① 收完整的【请求头】（直到出现 \r\n\r\n）=====
+        while (body == NULL) {
+            if (req_len >= MAX_REQUEST - 1) {
+                fprintf(stderr, "请求头超过上限\n");
+                break;
+            }
+            ssize_t n = recv(conn_fd, req + req_len, (size_t)(MAX_REQUEST - 1 - req_len), 0);
+            if (n <= 0) {
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "recv 头失败: %s\n", strerror(errno));
+                }
+                break;
+            }
+            req_len += n;
+            req[req_len] = '\0';            // 保持 NUL 结尾，strstr 才能安全扫描
+            body = find_body_start(req);
+        }
+
+        if (body == NULL) {
+            // 没收到完整的头：客户端断开 / 超时 / 请求非法
+            fprintf(stderr, "  没有收到完整的请求头（%ld 字节）\n", req_len);
+            send_response(conn_fd, "400 Bad Request", "text/html; charset=utf-8",
+                          bad_request_body, strlen(bad_request_body));
+            close(conn_fd);
+            continue;
+        }
+
+        // 头部日志（用 fwrite 显式长度，body 可能是二进制）
+        fprintf(stderr, "---- 请求头 ----\n");
+        fwrite(req, 1, (size_t)(body - req), stderr);
+        fprintf(stderr, "\n----------------\n");
+
+        // ===== ② 解析请求行 =====
+        char method[16] = {0};
+        char path[256]   = {0};
+        if (sscanf(req, "%15s %255s", method, path) != 2) {
+            send_response(conn_fd, "400 Bad Request", "text/html; charset=utf-8",
+                          bad_request_body, strlen(bad_request_body));
+            close(conn_fd);
+            continue;
+        }
+
+        // ===== ③ 解析 Content-Length，把【整个 body】收完 =====
+        long content_length = 0;
+        char* cl = find_ci(req, "Content-Length:");
+        if (cl != NULL) {
+            content_length = atol(cl + strlen("Content-Length:"));
+        }
+
+        if (content_length < 0 || (size_t)(body - req) + (size_t)content_length >= (size_t)MAX_REQUEST) {
+            fprintf(stderr, "  Content-Length 不合法或超限: %ld\n", content_length);
+            send_response(conn_fd, "413 Payload Too Large", "text/html; charset=utf-8",
+                          bad_request_body, strlen(bad_request_body));
+            close(conn_fd);
+            continue;
+        }
+
+        long body_got = req_len - (body - req);     // 第一次 recv 已经收到多少 body
+
+        while (body_got < content_length) {
+            ssize_t n = recv(conn_fd, req + req_len, (size_t)(MAX_REQUEST - 1 - req_len), 0);
+            if (n <= 0) {
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "recv body 失败: %s\n", strerror(errno));
+                }
+                break;
+            }
+            req_len  += n;
+            body_got += n;
+        }
+
+        // ★ 关键验证：收到的 body 字节数必须等于 Content-Length
+        fprintf(stderr, "  %s %s | Content-Length=%ld | 实际收到 body=%ld 字节 | %s\n",
+                method, path, content_length, body_got,
+                (body_got == content_length) ? "✅ 一致" : "❌ 不一致");
+
+        // ===== ④ 路由 =====
+        if (strcmp(method, "GET") == 0)
         {
-            fprintf(stderr, "---- 收到请求 ----\n%s\n------------------\n", buf);
-
-            char method[16] = {0};
-            char path[256]   = {0};
-            sscanf(buf, "%15s %255s", method, path);
-
-            // 只接受 GET
-            if (strcmp(method, "GET") != 0) 
-            {
-                send_response(conn_fd, "405 Method Not Allowed",
-                              "text/html; charset=utf-8",
+            char resolved[PATH_MAX];
+            if (!safe_path(path, resolved, sizeof(resolved))) {
+                send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
                               not_found_body, strlen(not_found_body));
             } else {
-                char resolved[PATH_MAX];
-                if (!safe_path(path, resolved, sizeof(resolved))) 
-                {
-                    // 文件不存在，或者试图跳出 static 目录
-                    fprintf(stderr, "  拒绝路径: %s\n", path);
-                    send_response(conn_fd, "404 Not Found",
-                                  "text/html; charset=utf-8",
-                                  not_found_body, strlen(not_found_body));
+                char* data = NULL;
+                long  len  = 0;
+                if (read_file(resolved, &data, &len)) {
+                    send_response(conn_fd, "200 OK", content_type_of(resolved),
+                                  data, (size_t)len);
+                    free(data);
                 } else {
-                    char* data = NULL;
-                    long  len  = 0;
-                    if (read_file(resolved, &data, &len)) {
-                        send_response(conn_fd, "200 OK", content_type_of(resolved),
-                                      data, (size_t)len);
-                        free(data);
-                    } else {
-                        send_response(conn_fd, "500 Internal Server Error",
-                                      "text/html; charset=utf-8",
-                                      internal_error_body, strlen(internal_error_body));
-                    }
+                    send_response(conn_fd, "500 Internal Server Error",
+                                  "text/html; charset=utf-8",
+                                  internal_error_body, strlen(internal_error_body));
                 }
             }
         }
-        else if (recv_len == 0)
+        else if (strcmp(method, "POST") == 0)
         {
-            fprintf(stderr, "客户端正常关闭连接\n");
+            // 第 5 步：先把 body 原样返回，用来验证"收全了"
+            // 下一步会在这里接 /infer
+            send_response(conn_fd, "200 OK", "text/plain; charset=utf-8",
+                          body, (size_t)body_got);
         }
         else
         {
-            perror("recv 出错");
+            send_response(conn_fd, "405 Method Not Allowed", "text/html; charset=utf-8",
+                          bad_request_body, strlen(bad_request_body));
         }
 
         close(conn_fd);
     }
+
+    free(req);
     close(listen_fd);
     return 0;
 }
