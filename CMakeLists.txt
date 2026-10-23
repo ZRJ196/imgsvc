@@ -14,8 +14,12 @@ list(APPEND CMAKE_PREFIX_PATH /opt/onnxruntime)
 find_package(OpenCV REQUIRED) #添加opencv库
 # ONNX Runtime：官方 tarball 自带的 CMake 配置和实际布局不一致，直接用 find_library
 find_library(ONNXRUNTIME_LIB NAMES onnxruntime PATHS /opt/onnxruntime/lib REQUIRED)
+# MySQL 客户端库
+find_library(MYSQL_LIB NAMES mysqlclient REQUIRED)
+# OpenSSL（算 SHA-256 只需要 libcrypto）
+find_library(CRYPTO_LIB NAMES crypto REQUIRED)
 
-# ---- 三个模块（两个可执行文件共用）----
+# ---- 三个处理模块（两个可执行文件共用）----
 set(IMGSVC_MODULES
     src/preprocess.cpp
     src/infer.cpp
@@ -32,9 +36,11 @@ target_include_directories(imgsvc PRIVATE
 target_link_libraries(imgsvc PRIVATE ${OpenCV_LIBS})
 target_link_libraries(imgsvc PRIVATE ${ONNXRUNTIME_LIB})
 
-# ---- HTTP 服务端 ----
+# ---- HTTP 服务端（额外需要 db + hash）----
 add_executable(imgsvc-server
     src/server.cpp
+    src/db.cpp
+    src/hash.cpp
     ${IMGSVC_MODULES})
 
 target_include_directories(imgsvc-server PRIVATE
@@ -42,3 +48,13 @@ target_include_directories(imgsvc-server PRIVATE
     /opt/onnxruntime/include)
 target_link_libraries(imgsvc-server PRIVATE ${OpenCV_LIBS})
 target_link_libraries(imgsvc-server PRIVATE ${ONNXRUNTIME_LIB})
+target_link_libraries(imgsvc-server PRIVATE ${MYSQL_LIB})
+target_link_libraries(imgsvc-server PRIVATE ${CRYPTO_LIB})
+
+# ---- db 模块的独立测试程序 ----
+add_executable(test_db
+    tests/test_db.cpp
+    src/db.cpp)
+
+target_include_directories(test_db PRIVATE include)
+target_link_libraries(test_db PRIVATE ${MYSQL_LIB})

@@ -1,6 +1,8 @@
 #include "preprocess.h"
 #include "infer.h"
 #include "postprocess.h"
+#include "hash.h"
+#include "db.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +12,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <chrono>
+#include <string>
 #include <vector>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -21,12 +25,15 @@
 #define STATIC_ROOT "static"
 #define MODEL_PATH "models/u2net.onnx"
 
-// 单个请求的最大字节数（头 + body）。
-// 不能按 Content-Length 去 malloc ——恶意客户端谎报巨大值会耗尽内存。
-#define MAX_REQUEST (10 * 1024 * 1024)
+// TODO: 以后移到 config.json
+#define DB_HOST "127.0.0.1"
+#define DB_USER "imgsvc"
+#define DB_PASS "imgsvc123"
+#define DB_NAME "imgsvc"
 
-// recv 超时（秒）。防止"客户端连上了但一个字不发"把单线程服务器卡死。
+#define MAX_REQUEST (10 * 1024 * 1024)
 #define RECV_TIMEOUT_SEC 5
+#define HISTORY_LIMIT 20
 
 // ---------- 发数据 ----------
 
@@ -183,6 +190,23 @@ static char* find_body_start(char* req)
     return (sep == NULL) ? NULL : sep + 4;
 }
 
+// 从某个请求头里取出值（到行尾为止），去掉前导空格
+static void header_value(char* req, const char* name, char* out, size_t out_size)
+{
+    out[0] = '\0';
+    char* p = find_ci(req, name);
+    if (p == NULL) return;
+
+    p += strlen(name);
+    while (*p == ' ' || *p == '\t') p++;
+
+    size_t i = 0;
+    while (*p != '\0' && *p != '\r' && *p != '\n' && i < out_size - 1) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+}
+
 // ---------- main ----------
 
 int main()
@@ -194,9 +218,14 @@ int main()
         return 1;
     }
 
+    // ===== 数据库：连不上不致命，服务照常跑，只是不记录 =====
+    Db db;
+    if (!db.connect(DB_HOST, DB_USER, DB_PASS, DB_NAME)) {
+        fprintf(stderr, "数据库连接失败，推理记录将不会入库\n");
+    }
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd == -1)
-    {
+    if (listen_fd == -1) {
         perror("socket创建失败");
         return 1;
     }
@@ -210,19 +239,16 @@ int main()
     serv_addr.sin_port = htons(PORT);
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
-    {
+    if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1) {
         perror("bind 绑定失败");
         return 1;
     }
-    if (listen(listen_fd, 5) == -1)
-    {
+    if (listen(listen_fd, 5) == -1) {
         perror("listen 监听失败");
         return 1;
     }
     fprintf(stderr, "HTTP 服务端启动，监听端口 %d，静态目录 %s/\n", PORT, STATIC_ROOT);
 
-    // 请求缓冲区只分配一次，每个连接复用
     char* req = (char*)malloc(MAX_REQUEST);
     if (req == NULL) {
         fprintf(stderr, "malloc 失败\n");
@@ -250,8 +276,7 @@ int main()
         sockaddr_in cli_addr;
         socklen_t cli_len = sizeof(cli_addr);
         int conn_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
-        if (conn_fd == -1)
-        {
+        if (conn_fd == -1) {
             perror("accept 失败");
             continue;
         }
@@ -294,7 +319,6 @@ int main()
             continue;
         }
 
-        // 只把【请求头】写进日志（body 可能是二进制）
         fprintf(stderr, "---- 请求头 ----\n");
         fwrite(req, 1, (size_t)(body - req), stderr);
         fprintf(stderr, "\n----------------\n");
@@ -325,7 +349,7 @@ int main()
             continue;
         }
 
-        long body_got = req_len - (body - req);     // 第一次 recv 已经收到多少 body
+        long body_got = req_len - (body - req);
 
         while (body_got < content_length) {
             ssize_t n = recv(conn_fd, req + req_len, (size_t)(MAX_REQUEST - 1 - req_len), 0);
@@ -347,21 +371,32 @@ int main()
         // ===== ④ 路由 =====
         if (strcmp(method, "GET") == 0)
         {
-            char resolved[PATH_MAX];
-            if (!safe_path(path, resolved, sizeof(resolved))) {
-                send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
-                              not_found_body, strlen(not_found_body));
-            } else {
-                char* data = NULL;
-                long  len  = 0;
-                if (read_file(resolved, &data, &len)) {
-                    send_response(conn_fd, "200 OK", content_type_of(resolved),
-                                  data, (size_t)len);
-                    free(data);
+            if (strcmp(path, "/history") == 0)
+            {
+                // 历史查询：返回最近 N 条推理记录的 JSON
+                std::string js = db.recent_json(HISTORY_LIMIT);
+                fprintf(stderr, "  /history: 返回 %zu 字节 JSON\n", js.size());
+                send_response(conn_fd, "200 OK", "application/json; charset=utf-8",
+                              js.data(), js.size());
+            }
+            else
+            {
+                char resolved[PATH_MAX];
+                if (!safe_path(path, resolved, sizeof(resolved))) {
+                    send_response(conn_fd, "404 Not Found", "text/html; charset=utf-8",
+                                  not_found_body, strlen(not_found_body));
                 } else {
-                    send_response(conn_fd, "500 Internal Server Error",
-                                  "text/html; charset=utf-8",
-                                  internal_error_body, strlen(internal_error_body));
+                    char* data = NULL;
+                    long  len  = 0;
+                    if (read_file(resolved, &data, &len)) {
+                        send_response(conn_fd, "200 OK", content_type_of(resolved),
+                                      data, (size_t)len);
+                        free(data);
+                    } else {
+                        send_response(conn_fd, "500 Internal Server Error",
+                                      "text/html; charset=utf-8",
+                                      internal_error_body, strlen(internal_error_body));
+                    }
                 }
             }
         }
@@ -369,27 +404,51 @@ int main()
         {
             if (strcmp(path, "/infer") == 0)
             {
-                // 上传的图片原始字节 → 解码 → 预处理 → 推理 → 透明背景 PNG
+                // 客户端可以用 X-Filename 头带文件名（可选）
+                char image_name[256];
+                header_value(req, "X-Filename:", image_name, sizeof(image_name));
+                if (image_name[0] == '\0') {
+                    snprintf(image_name, sizeof(image_name), "upload");
+                }
+
                 std::vector<unsigned char> bytes(body, body + body_got);
+
+                // ---- 计时开始 ----
+                auto t0 = std::chrono::steady_clock::now();
+
                 cv::Mat blob, orig;
                 std::vector<float> mask;
                 std::vector<unsigned char> png;
+                int fail = 0;   // 0=成功 1=不是图片 2=推理失败 3=编码失败
 
-                if (!preprocess_bytes(bytes, blob, orig)) {
+                if (!preprocess_bytes(bytes, blob, orig))     fail = 1;
+                else if (!engine.run(blob, mask))             fail = 2;
+                else if (!make_cutout_png(orig, mask, png))   fail = 3;
+
+                auto t1 = std::chrono::steady_clock::now();
+                int cost_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+                // ---- 计时结束 ----
+
+                if (fail == 1) {
                     fprintf(stderr, "  /infer: 不是有效图片（%ld 字节）\n", body_got);
                     send_response(conn_fd, "400 Bad Request", "text/plain; charset=utf-8",
                                   "不是有效的图片", strlen("不是有效的图片"));
-                } else if (!engine.run(blob, mask)) {
+                } else if (fail == 2) {
                     send_response(conn_fd, "500 Internal Server Error",
                                   "text/plain; charset=utf-8",
                                   "推理失败", strlen("推理失败"));
-                } else if (!make_cutout_png(orig, mask, png)) {
+                } else if (fail == 3) {
                     send_response(conn_fd, "500 Internal Server Error",
                                   "text/plain; charset=utf-8",
                                   "生成图片失败", strlen("生成图片失败"));
                 } else {
-                    fprintf(stderr, "  /infer: 输入 %ld 字节 (%dx%d) → PNG %zu 字节\n",
-                            body_got, orig.cols, orig.rows, png.size());
+                    // 算内容指纹并入库
+                    const std::string hash = sha256_hex(bytes.data(), bytes.size());
+                    db.log_infer(image_name, hash, orig.cols, orig.rows, cost_ms);
+
+                    fprintf(stderr, "  /infer: %s | %dx%d | %d ms | PNG %zu 字节 | hash=%.12s…\n",
+                            image_name, orig.cols, orig.rows, cost_ms, png.size(), hash.c_str());
+
                     send_response(conn_fd, "200 OK", "image/png", png.data(), png.size());
                 }
             }
