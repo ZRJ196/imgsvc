@@ -1,39 +1,55 @@
 #include "postprocess.h"
 #include <iostream>
 
-bool make_cutout_rgba(const cv::Mat& orig, const std::vector<float>& mask, cv::Mat& rgba)
+bool make_cutout_rgba(const cv::Mat& orig, const std::vector<float>& mask,
+                      cv::Mat& rgba, const cv::Rect& roi)
 {
-    const int W = 320;
-    const int H = 320;
+    const int MW = 320;
+    const int MH = 320;
 
-    if (orig.empty() || (int)mask.size() != W * H) {
+    if (orig.empty() || (int)mask.size() != MW * MH) {
         return false;
     }
 
-    // 用 OpenCV 包一层（不拷贝数据，只读）
-    cv::Mat maskMat(H, W, CV_32FC1, const_cast<float*>(mask.data()));
+    // 确定掩码覆盖的区域：默认整张图
+    // 非法 roi（宽高<=0、越界）一律退回整张图，避免 orig(roi) 抛异常
+    cv::Rect r = roi;
+    if (r.width <= 0 || r.height <= 0 ||
+        r.x < 0 || r.y < 0 ||
+        r.x + r.width > orig.cols || r.y + r.height > orig.rows) {
+        r = cv::Rect(0, 0, orig.cols, orig.rows);
+    }
 
-    // 放大回原图尺寸：放大用 INTER_LINEAR（缩小才用 INTER_AREA）
-    cv::Mat maskFull;
-    cv::resize(maskMat, maskFull, orig.size(), 0, 0, cv::INTER_LINEAR);
+    // 用 OpenCV 包一层（不拷贝数据，只读）
+    cv::Mat maskMat(MH, MW, CV_32FC1, const_cast<float*>(mask.data()));
+
+    // 放大到 roi 的尺寸（放大用 INTER_LINEAR，缩小才用 INTER_AREA）
+    cv::Mat maskRoi;
+    cv::resize(maskMat, maskRoi, r.size(), 0, 0, cv::INTER_LINEAR);
 
     // 转成 8 位灰度（0~255）
     cv::Mat mask8;
-    maskFull.convertTo(mask8, CV_8U, 255.0);
+    maskRoi.convertTo(mask8, CV_8U, 255.0);
 
-    // 把掩码作为 alpha 通道，和原图合并成 BGRA
+    // ★ 关键：先建一张全透明的 alpha，只把 roi 那块填进去
+    //   这样输出和原图同尺寸，roi 以外的区域全透明
+    cv::Mat alpha(orig.size(), CV_8U, cv::Scalar(0));
+    mask8.copyTo(alpha(r));
+
+    // 把 alpha 作为第 4 通道合并成 BGRA
     std::vector<cv::Mat> ch;
-    cv::split(orig, ch);          // BGR → 三个单通道
-    ch.push_back(mask8);          // 加上 alpha
-    cv::merge(ch, rgba);          // → BGRA 四通道
+    cv::split(orig, ch);
+    ch.push_back(alpha);
+    cv::merge(ch, rgba);
 
     return true;
 }
 
-bool saveCutout(const std::string& outPath, const cv::Mat& orig, const std::vector<float>& mask)
+bool saveCutout(const std::string& outPath, const cv::Mat& orig,
+                const std::vector<float>& mask, const cv::Rect& roi)
 {
     cv::Mat rgba;
-    if (!make_cutout_rgba(orig, mask, rgba)) {
+    if (!make_cutout_rgba(orig, mask, rgba, roi)) {
         std::cout << "生成掩码图失败" << std::endl;
         return false;
     }
@@ -45,10 +61,10 @@ bool saveCutout(const std::string& outPath, const cv::Mat& orig, const std::vect
 }
 
 bool make_cutout_png(const cv::Mat& orig, const std::vector<float>& mask,
-                     std::vector<unsigned char>& png)
+                     std::vector<unsigned char>& png, const cv::Rect& roi)
 {
     cv::Mat rgba;
-    if (!make_cutout_rgba(orig, mask, rgba)) {
+    if (!make_cutout_rgba(orig, mask, rgba, roi)) {
         return false;
     }
     // imencode：把 Mat 编码成内存里的 PNG 字节（不落盘）

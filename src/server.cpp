@@ -1,4 +1,4 @@
-#include "preprocess.h"
+﻿#include "preprocess.h"
 #include "infer.h"
 #include "postprocess.h"
 #include "hash.h"
@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <algorithm>        // std::min / std::max
 #include <chrono>
 #include <string>
 #include <vector>
@@ -413,17 +414,55 @@ int main()
 
                 std::vector<unsigned char> bytes(body, body + body_got);
 
+                // ---- 解析可选的裁剪框（请求头 X-Crop: x,y,w,h）----
+                int crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
+                {
+                    char cropbuf[64];
+                    header_value(req, "X-Crop:", cropbuf, sizeof(cropbuf));
+                    if (cropbuf[0] != '\0') {
+                        sscanf(cropbuf, "%d,%d,%d,%d", &crop_x, &crop_y, &crop_w, &crop_h);
+                    }
+                }
+
                 // ---- 计时开始 ----
                 auto t0 = std::chrono::steady_clock::now();
 
-                cv::Mat blob, orig;
-                std::vector<float> mask;
+                cv::Mat orig;
                 std::vector<unsigned char> png;
-                int fail = 0;   // 0=成功 1=不是图片 2=推理失败 3=编码失败
+                cv::Rect roi;          // 空矩形 = 不裁剪
+                int fail = 0;          // 0=成功 1=不是图片 2=推理失败 3=编码失败
 
-                if (!preprocess_bytes(bytes, blob, orig))     fail = 1;
-                else if (!engine.run(blob, mask))             fail = 2;
-                else if (!make_cutout_png(orig, mask, png))   fail = 3;
+                {
+                    cv::Mat blob;
+                    if (!preprocess_bytes(bytes, blob, orig)) {
+                        fail = 1;
+                    } else {
+                        // 有合法裁剪框：裁出来重新生成 blob，
+                        // 让框内物体成为画面里唯一的显著目标
+                        if (crop_w >= 8 && crop_h >= 8) {
+                            int x = std::max(0, std::min(crop_x, orig.cols - 1));
+                            int y = std::max(0, std::min(crop_y, orig.rows - 1));
+                            int w = std::min(crop_w, orig.cols - x);
+                            int h = std::min(crop_h, orig.rows - y);
+                            if (w >= 8 && h >= 8) {
+                                roi = cv::Rect(x, y, w, h);
+                                cv::Mat crop_img = orig(roi).clone();
+                                if (!make_blob(crop_img, blob)) {
+                                    fail = 1;
+                                }
+                            }
+                        }
+
+                        if (fail == 0) {
+                            std::vector<float> mask;
+                            if (!engine.run(blob, mask)) {
+                                fail = 2;
+                            } else if (!make_cutout_png(orig, mask, png, roi)) {
+                                fail = 3;
+                            }
+                        }
+                    }
+                }
 
                 auto t1 = std::chrono::steady_clock::now();
                 int cost_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -446,8 +485,16 @@ int main()
                     const std::string hash = sha256_hex(bytes.data(), bytes.size());
                     db.log_infer(image_name, hash, orig.cols, orig.rows, cost_ms);
 
-                    fprintf(stderr, "  /infer: %s | %dx%d | %d ms | PNG %zu 字节 | hash=%.12s…\n",
+                    if (roi.width > 0 && roi.height > 0) {
+                        fprintf(stderr,
+                            "  /infer: %s | 裁剪 [%d,%d %dx%d] | 原图 %dx%d | %d ms | PNG %zu 字节 | hash=%.12s…\n",
+                            image_name, roi.x, roi.y, roi.width, roi.height,
+                            orig.cols, orig.rows, cost_ms, png.size(), hash.c_str());
+                    } else {
+                        fprintf(stderr,
+                            "  /infer: %s | 全图 %dx%d | %d ms | PNG %zu 字节 | hash=%.12s…\n",
                             image_name, orig.cols, orig.rows, cost_ms, png.size(), hash.c_str());
+                    }
 
                     send_response(conn_fd, "200 OK", "image/png", png.data(), png.size());
                 }

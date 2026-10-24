@@ -7,7 +7,7 @@
 //
 // blob 是 NCHW 布局：内存里依次是 [通道0 的全部像素][通道1][通道2]
 // 所以"通道 c 的第 i 个像素"在内存中的下标是 c * HW + i
-static bool make_blob(const cv::Mat& img, cv::Mat& blob)
+bool make_blob(const cv::Mat& img, cv::Mat& blob)
 {
     if (img.empty()) {
         return false;

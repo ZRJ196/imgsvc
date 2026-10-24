@@ -15,3 +15,9 @@ bool preprocess(const std::string& imgPath, cv::Mat& blob, cv::Mat& orig);
 //
 // 成功返回 true；bytes 不是有效图片时返回 false
 bool preprocess_bytes(const std::vector<unsigned char>& bytes, cv::Mat& blob, cv::Mat& orig);
+
+// 直接把一张 BGR 图变成模型输入张量（不做解码）
+//
+// 服务端"框选裁剪"用：先把原图裁出一块，再对这块调用本函数，
+// 这样框内的物体就重新变成了画面里唯一的显著目标。
+bool make_blob(const cv::Mat& img, cv::Mat& blob);
