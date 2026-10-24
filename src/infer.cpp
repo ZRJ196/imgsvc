@@ -9,7 +9,7 @@ InferEngine::InferEngine(const std::string& modelPath)
         // 模型只在这里加载一次
         session_ = std::make_unique<Ort::Session>(env_, modelPath.c_str(), opts_);
 
-        // 取出输入输出的名字：按索引取，不要写死
+        // 取出输入输出的名字：按索引取
         // （这个模型的输出名字是 PyTorch 内部张量 ID，如 1959，换个导出环境就变）
         auto in  = session_->GetInputNameAllocated(0, alloc_);
         auto out = session_->GetOutputNameAllocated(0, alloc_);
